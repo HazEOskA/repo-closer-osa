@@ -68,7 +68,7 @@ PY
       - |
         URL="$$(gcloud run services describe "${_SERVICE}" --region="${_REGION}" --format='value(status.url)')"
         test -n "$$URL"
-        curl -fsS "$$URL/health" | grep -q '"'"'"ok"'"'":true'
+        curl -fsS "$$URL/health" | grep -q '"ok":true'
         echo "REPO_CLOSER_URL=$$URL"
 
 images:
