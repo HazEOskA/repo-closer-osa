@@ -1,0 +1,78 @@
+substitutions:
+  _REGION: europe-west1
+  _AR_REPO: repo-closer
+  _SERVICE: repo-closer-osa
+  _SA: repo-closer-sa
+  _MODEL: gemini-2.5-flash
+
+timeout: 1800s
+
+steps:
+  - id: ensure-infra
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: bash
+    args:
+      - -ceu
+      - |
+        gcloud artifacts repositories describe "${_AR_REPO}" --location="${_REGION}" >/dev/null 2>&1 || \
+          gcloud artifacts repositories create "${_AR_REPO}" --repository-format=docker --location="${_REGION}" --quiet
+        gcloud iam service-accounts describe "${_SA}@$PROJECT_ID.iam.gserviceaccount.com" >/dev/null 2>&1 || \
+          gcloud iam service-accounts create "${_SA}" --display-name="OSA Repo Closer" --quiet
+        for role in roles/datastore.user roles/aiplatform.user roles/cloudbuild.builds.editor roles/run.admin roles/artifactregistry.writer roles/iam.serviceAccountUser; do
+          gcloud projects add-iam-policy-binding "$PROJECT_ID" --member="serviceAccount:${_SA}@$PROJECT_ID.iam.gserviceaccount.com" --role="$$role" --quiet >/dev/null || true
+        done
+        for secret in repo-closer-api-token repo-closer-approval-secret; do
+          if ! gcloud secrets describe "$$secret" >/dev/null 2>&1; then
+            printf '%s' "$$(python3 - <<'PY'
+import secrets
+print(secrets.token_urlsafe(48))
+PY
+)" | gcloud secrets create "$$secret" --data-file=- --quiet
+          fi
+          gcloud secrets add-iam-policy-binding "$$secret" --member="serviceAccount:${_SA}@$PROJECT_ID.iam.gserviceaccount.com" --role=roles/secretmanager.secretAccessor --quiet >/dev/null
+        done
+
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args: ["build", "-t", "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE}:$BUILD_ID", "."]
+
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    args: ["push", "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE}:$BUILD_ID"]
+
+  - id: deploy
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: bash
+    args:
+      - -ceu
+      - |
+        GITHUB_SECRET_ARGS=""
+        if gcloud secrets describe repo-closer-github-token >/dev/null 2>&1; then
+          gcloud secrets add-iam-policy-binding repo-closer-github-token --member="serviceAccount:${_SA}@$PROJECT_ID.iam.gserviceaccount.com" --role=roles/secretmanager.secretAccessor --quiet >/dev/null
+          GITHUB_SECRET_ARGS=",GITHUB_TOKEN=repo-closer-github-token:latest"
+        fi
+        gcloud run deploy "${_SERVICE}" \
+          --image="${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE}:$BUILD_ID" \
+          --region="${_REGION}" \
+          --service-account="${_SA}@$PROJECT_ID.iam.gserviceaccount.com" \
+          --port=8080 --cpu=1 --memory=1Gi --min-instances=0 --max-instances=2 --concurrency=1 --timeout=3600 \
+          --set-env-vars="^@^GOOGLE_CLOUD_PROJECT=$PROJECT_ID@GOOGLE_CLOUD_LOCATION=global@MAINTENANCE_MODEL=${_MODEL}@MAINTENANCE_STORE=firestore" \
+          --set-secrets="MAINTENANCE_API_TOKEN=repo-closer-api-token:latest,MAINTENANCE_APPROVAL_SECRET=repo-closer-approval-secret:latest$${GITHUB_SECRET_ARGS}" \
+          --allow-unauthenticated --quiet
+
+  - id: smoke
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: bash
+    args:
+      - -ceu
+      - |
+        URL="$$(gcloud run services describe "${_SERVICE}" --region="${_REGION}" --format='value(status.url)')"
+        test -n "$$URL"
+        curl -fsS "$$URL/health" | grep -q '"ok":true'
+        echo "REPO_CLOSER_URL=$$URL"
+
+images:
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE}:$BUILD_ID
+
+options:
+  logging: CLOUD_LOGGING_ONLY

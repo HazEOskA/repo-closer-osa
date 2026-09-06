@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "repo-closer-osa"
+version = "0.2.0"
+description = "OSA Autonomous Maintenance Engine — on-demand repository repair loop"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.116",
+  "uvicorn[standard]>=0.35",
+  "google-genai>=1.33",
+  "google-cloud-firestore>=2.21",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "httpx>=0.28"]
+
+[project.scripts]
+repo-closer = "repo_closer.cli:main"
+repo-closer-api = "repo_closer.api:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
