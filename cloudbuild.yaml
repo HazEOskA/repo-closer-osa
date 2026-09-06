@@ -52,24 +52,32 @@ steps:
     args:
       - -ceu
       - |
-        GITHUB_SECRET_ARGS=""
         if gcloud secrets describe repo-closer-github-token >/dev/null 2>&1; then
           gcloud secrets add-iam-policy-binding repo-closer-github-token \
             --member="serviceAccount:${_SA}@$PROJECT_ID.iam.gserviceaccount.com" \
             --role=roles/secretmanager.secretAccessor \
             --quiet >/dev/null
-          GITHUB_SECRET_ARGS=",GITHUB_TOKEN=repo-closer-github-token:latest"
-        fi
 
-        gcloud run deploy "${_SERVICE}" \
-          --image="${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE}:$BUILD_ID" \
-          --region="${_REGION}" \
-          --service-account="${_SA}@$PROJECT_ID.iam.gserviceaccount.com" \
-          --port=8080 --cpu=1 --memory=1Gi \
-          --min-instances=0 --max-instances=2 --concurrency=1 --timeout=3600 \
-          --set-env-vars="^@^GOOGLE_CLOUD_PROJECT=$PROJECT_ID@GOOGLE_CLOUD_LOCATION=global@MAINTENANCE_MODEL=${_MODEL}@MAINTENANCE_STORE=firestore" \
-          --set-secrets="MAINTENANCE_API_TOKEN=repo-closer-api-token:latest,MAINTENANCE_APPROVAL_SECRET=repo-closer-approval-secret:latest${GITHUB_SECRET_ARGS}" \
-          --allow-unauthenticated --quiet
+          gcloud run deploy "${_SERVICE}" \
+            --image="${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE}:$BUILD_ID" \
+            --region="${_REGION}" \
+            --service-account="${_SA}@$PROJECT_ID.iam.gserviceaccount.com" \
+            --port=8080 --cpu=1 --memory=1Gi \
+            --min-instances=0 --max-instances=2 --concurrency=1 --timeout=3600 \
+            --set-env-vars="^@^GOOGLE_CLOUD_PROJECT=$PROJECT_ID@GOOGLE_CLOUD_LOCATION=global@MAINTENANCE_MODEL=${_MODEL}@MAINTENANCE_STORE=firestore" \
+            --set-secrets="MAINTENANCE_API_TOKEN=repo-closer-api-token:latest,MAINTENANCE_APPROVAL_SECRET=repo-closer-approval-secret:latest,GITHUB_TOKEN=repo-closer-github-token:latest" \
+            --allow-unauthenticated --quiet
+        else
+          gcloud run deploy "${_SERVICE}" \
+            --image="${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE}:$BUILD_ID" \
+            --region="${_REGION}" \
+            --service-account="${_SA}@$PROJECT_ID.iam.gserviceaccount.com" \
+            --port=8080 --cpu=1 --memory=1Gi \
+            --min-instances=0 --max-instances=2 --concurrency=1 --timeout=3600 \
+            --set-env-vars="^@^GOOGLE_CLOUD_PROJECT=$PROJECT_ID@GOOGLE_CLOUD_LOCATION=global@MAINTENANCE_MODEL=${_MODEL}@MAINTENANCE_STORE=firestore" \
+            --set-secrets="MAINTENANCE_API_TOKEN=repo-closer-api-token:latest,MAINTENANCE_APPROVAL_SECRET=repo-closer-approval-secret:latest" \
+            --allow-unauthenticated --quiet
+        fi
 
   - id: smoke
     name: gcr.io/google.com/cloudsdktool/cloud-sdk
