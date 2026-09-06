@@ -1,2 +1,2 @@
-"""OSA Repo Closer."""
-__version__ = "0.1.0"
+"""OSA Repo Closer — Autonomous Maintenance Engine."""
+__version__ = "0.2.0"
