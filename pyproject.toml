@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "httpx>=0.28"]
+dev = ["pytest>=8.0", "httpx>=0.28", "pyyaml>=6.0"]
 
 [project.scripts]
 repo-closer = "repo_closer.cli:main"
