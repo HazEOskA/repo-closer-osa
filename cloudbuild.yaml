@@ -5,6 +5,10 @@ substitutions:
   _SA: repo-closer-sa
   _MODEL: gemini-2.5-flash
   _FIRESTORE_LOCATION: europe-west1
+  # The service's own BUILDING/DEPLOYING stages shell out to gcloud on behalf
+  # of the repository it is repairing. Set to "false" to deploy a read-only
+  # Repo Closer that can map/audit/plan and open PRs but cannot build or deploy.
+  _GRANT_RUNTIME_DEPLOY_ROLES: "true"
 
 timeout: 1800s
 
@@ -73,17 +77,35 @@ steps:
         #        aiplatform.user -> call Vertex/Gemini for the FIXING stage
         #        logging.logWriter -> emit its own Cloud Run logs
         #        Secret access is granted per-secret in step 6, never project-wide.
-        #        No admin roles: the service is NOT granted project IAM, Cloud Run,
-        #        Cloud Build or Artifact Registry administration.
-        echo "-- granting runtime roles"
-        for role in roles/datastore.user roles/aiplatform.user roles/logging.logWriter; do
+        #        The service is never granted project IAM administration.
+        grant_runtime_role() {
           gcloud projects add-iam-policy-binding "$PROJECT_ID" \
             --member="serviceAccount:$$RUNTIME_SA" \
-            --role="$$role" \
+            --role="$$1" \
             --condition=None \
             --quiet >/dev/null \
-            || fail "cannot bind $$role to runtime SA (deployer needs roles/resourcemanager.projectIamAdmin)"
+            || fail "cannot bind $$1 to runtime SA (deployer needs roles/resourcemanager.projectIamAdmin)"
+        }
+
+        echo "-- granting core runtime roles"
+        for role in roles/datastore.user roles/aiplatform.user roles/logging.logWriter; do
+          grant_runtime_role "$$role"
         done
+
+        # --- 5b. Deploy-stage roles.
+        #        These exist only because the Repo Closer itself runs
+        #        'gcloud builds submit' and 'gcloud run deploy' against the
+        #        repository under repair, behind its own DEPLOY approval gate.
+        #        Drop them by setting _GRANT_RUNTIME_DEPLOY_ROLES=false, which
+        #        leaves a service that can still map, audit, plan and open PRs.
+        if [ "${_GRANT_RUNTIME_DEPLOY_ROLES}" = "true" ]; then
+          echo "-- granting deploy-stage runtime roles"
+          for role in roles/cloudbuild.builds.editor roles/run.admin roles/artifactregistry.writer roles/iam.serviceAccountUser roles/storage.admin; do
+            grant_runtime_role "$$role"
+          done
+        else
+          echo "-- skipping deploy-stage roles (_GRANT_RUNTIME_DEPLOY_ROLES=false)"
+        fi
 
         # --- 6. Secrets: create if absent, grant accessor to the runtime SA only.
         echo "-- ensuring secrets"

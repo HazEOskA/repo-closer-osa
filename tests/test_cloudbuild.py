@@ -23,14 +23,25 @@ BUILTIN_SUBSTITUTIONS = {
     "TRIGGER_BUILD_CONFIG_PATH",
 }
 
-# Roles the running service genuinely needs. Anything beyond this on the
-# runtime SA is privilege creep and should be a deliberate, reviewed change.
-ALLOWED_RUNTIME_ROLES = {
+# Roles the running service needs just to serve requests.
+CORE_RUNTIME_ROLES = {
     "roles/datastore.user",
     "roles/aiplatform.user",
     "roles/logging.logWriter",
     "roles/secretmanager.secretAccessor",
 }
+
+# Roles needed only by the service's own BUILDING/DEPLOYING stages. They are
+# broad, so they must stay behind the _GRANT_RUNTIME_DEPLOY_ROLES switch.
+DEPLOY_STAGE_ROLES = {
+    "roles/cloudbuild.builds.editor",
+    "roles/run.admin",
+    "roles/artifactregistry.writer",
+    "roles/iam.serviceAccountUser",
+    "roles/storage.admin",
+}
+
+ALLOWED_RUNTIME_ROLES = CORE_RUNTIME_ROLES | DEPLOY_STAGE_ROLES
 
 
 @pytest.fixture(scope="module")
@@ -113,6 +124,27 @@ def test_runtime_service_account_gets_no_admin_roles(config):
     escalated = granted - ALLOWED_RUNTIME_ROLES
     assert not escalated, f"runtime SA is bound to escalated roles: {sorted(escalated)}"
     assert "roles/secretmanager.secretAccessor" in granted
+
+
+def test_broad_deploy_roles_stay_behind_the_opt_out_switch(config):
+    """The broad roles must only be granted inside the gated block."""
+    script = _script(_step(config, "ensure-infra"))
+    gate = "_GRANT_RUNTIME_DEPLOY_ROLES"
+    assert gate in config["substitutions"], f"{gate} must be a declared substitution"
+
+    guarded = re.search(
+        r'if \[ "\$\{%s\}" = "true" \]; then(.*?)^\s*else\b' % gate,
+        script,
+        re.DOTALL | re.MULTILINE,
+    )
+    assert guarded, "deploy-stage roles are not wrapped in the opt-out guard"
+    guarded_roles = set(re.findall(r"roles/[a-zA-Z0-9._]+", guarded.group(1)))
+    assert guarded_roles == DEPLOY_STAGE_ROLES
+
+    # None of them may also be granted unconditionally elsewhere in the step.
+    outside = script.replace(guarded.group(1), "")
+    for role in DEPLOY_STAGE_ROLES - {"roles/iam.serviceAccountUser"}:
+        assert role not in outside, f"{role} is granted outside the guard"
 
 
 def test_deployer_actas_binding_does_not_target_the_runtime_identity(config):
