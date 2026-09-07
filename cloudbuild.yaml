@@ -4,39 +4,131 @@ substitutions:
   _SERVICE: repo-closer-osa
   _SA: repo-closer-sa
   _MODEL: gemini-2.5-flash
+  _FIRESTORE_LOCATION: europe-west1
 
 timeout: 1800s
 
 steps:
+  # ---------------------------------------------------------------------------
+  # ensure-infra runs as the Cloud Build (deployer) identity.
+  # It provisions infrastructure and grants the RUNTIME service account only the
+  # roles the running service actually needs. The deployer's own permissions are
+  # never granted here - they are a prerequisite and are verified up front so a
+  # missing permission fails with a named cause instead of a bare exit 1.
+  # ---------------------------------------------------------------------------
   - id: ensure-infra
     name: gcr.io/google.com/cloudsdktool/cloud-sdk
     entrypoint: bash
     args:
       - -ceu
       - |
-        gcloud artifacts repositories describe "${_AR_REPO}" --location="${_REGION}" >/dev/null 2>&1 || \
-          gcloud artifacts repositories create "${_AR_REPO}" --repository-format=docker --location="${_REGION}" --quiet
+        RUNTIME_SA="${_SA}@$PROJECT_ID.iam.gserviceaccount.com"
+        echo "== ensure-infra: project=$PROJECT_ID region=${_REGION} runtime_sa=$$RUNTIME_SA"
+        echo "== deployer identity: $$(gcloud config get-value account 2>/dev/null)"
 
-        gcloud iam service-accounts describe "${_SA}@$PROJECT_ID.iam.gserviceaccount.com" >/dev/null 2>&1 || \
-          gcloud iam service-accounts create "${_SA}" --display-name="OSA Repo Closer" --quiet
+        fail() { echo "ENSURE_INFRA_FAILED: $$1" >&2; exit 1; }
 
-        for role in roles/datastore.user roles/aiplatform.user roles/cloudbuild.builds.editor roles/run.admin roles/artifactregistry.writer roles/iam.serviceAccountUser; do
+        # --- 1. Required APIs (idempotent; enabling an already-enabled API is a no-op)
+        echo "-- enabling required services"
+        gcloud services enable \
+          artifactregistry.googleapis.com \
+          run.googleapis.com \
+          secretmanager.googleapis.com \
+          firestore.googleapis.com \
+          aiplatform.googleapis.com \
+          iam.googleapis.com \
+          cloudresourcemanager.googleapis.com \
+          --quiet || fail "cannot enable required APIs (deployer needs roles/serviceusage.serviceUsageAdmin)"
+
+        # --- 2. Artifact Registry repository
+        if gcloud artifacts repositories describe "${_AR_REPO}" --location="${_REGION}" >/dev/null 2>&1; then
+          echo "-- artifact registry '${_AR_REPO}' already exists"
+        else
+          echo "-- creating artifact registry '${_AR_REPO}'"
+          gcloud artifacts repositories create "${_AR_REPO}" \
+            --repository-format=docker --location="${_REGION}" --quiet \
+            || fail "cannot create Artifact Registry repo '${_AR_REPO}' (deployer needs roles/artifactregistry.admin)"
+        fi
+
+        # --- 3. Runtime service account
+        if gcloud iam service-accounts describe "$$RUNTIME_SA" >/dev/null 2>&1; then
+          echo "-- runtime service account already exists"
+        else
+          echo "-- creating runtime service account '${_SA}'"
+          gcloud iam service-accounts create "${_SA}" --display-name="OSA Repo Closer runtime" --quiet \
+            || fail "cannot create service account '${_SA}' (deployer needs roles/iam.serviceAccountAdmin)"
+        fi
+
+        # --- 4. Firestore database (the run store; MAINTENANCE_STORE=firestore)
+        if gcloud firestore databases describe --database="(default)" >/dev/null 2>&1; then
+          echo "-- firestore (default) database already exists"
+        else
+          echo "-- creating firestore (default) database in ${_FIRESTORE_LOCATION}"
+          gcloud firestore databases create --location="${_FIRESTORE_LOCATION}" --type=firestore-native --quiet \
+            || fail "cannot create Firestore (default) database (deployer needs roles/datastore.owner)"
+        fi
+
+        # --- 5. Runtime IAM: least privilege for what the service actually does.
+        #        datastore.user  -> read/write its own run documents in Firestore
+        #        aiplatform.user -> call Vertex/Gemini for the FIXING stage
+        #        logging.logWriter -> emit its own Cloud Run logs
+        #        Secret access is granted per-secret in step 6, never project-wide.
+        #        No admin roles: the service is NOT granted project IAM, Cloud Run,
+        #        Cloud Build or Artifact Registry administration.
+        echo "-- granting runtime roles"
+        for role in roles/datastore.user roles/aiplatform.user roles/logging.logWriter; do
           gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-            --member="serviceAccount:${_SA}@$PROJECT_ID.iam.gserviceaccount.com" \
+            --member="serviceAccount:$$RUNTIME_SA" \
             --role="$$role" \
-            --quiet >/dev/null || true
+            --condition=None \
+            --quiet >/dev/null \
+            || fail "cannot bind $$role to runtime SA (deployer needs roles/resourcemanager.projectIamAdmin)"
         done
 
+        # --- 6. Secrets: create if absent, grant accessor to the runtime SA only.
+        echo "-- ensuring secrets"
         for secret in repo-closer-api-token repo-closer-approval-secret; do
-          if ! gcloud secrets describe "$$secret" >/dev/null 2>&1; then
-            python3 -c 'import secrets; print(secrets.token_urlsafe(48), end="")' | \
-              gcloud secrets create "$$secret" --data-file=- --quiet
+          if gcloud secrets describe "$$secret" >/dev/null 2>&1; then
+            echo "   secret '$$secret' already exists"
+          else
+            echo "   creating secret '$$secret'"
+            python3 -c 'import secrets; print(secrets.token_urlsafe(48), end="")' \
+              | gcloud secrets create "$$secret" --data-file=- --quiet \
+              || fail "cannot create secret '$$secret' (deployer needs roles/secretmanager.admin)"
           fi
           gcloud secrets add-iam-policy-binding "$$secret" \
-            --member="serviceAccount:${_SA}@$PROJECT_ID.iam.gserviceaccount.com" \
+            --member="serviceAccount:$$RUNTIME_SA" \
             --role=roles/secretmanager.secretAccessor \
-            --quiet >/dev/null
+            --condition=None \
+            --quiet >/dev/null \
+            || fail "cannot grant accessor on '$$secret' (deployer needs roles/secretmanager.admin)"
         done
+
+        # --- 7. Let the deployer act as the runtime SA (scoped to that SA, not the project).
+        #        Required by 'gcloud run deploy --service-account'.
+        echo "-- granting deployer actAs on the runtime SA"
+        DEPLOYER="$$(gcloud config get-value account 2>/dev/null)"
+        if [ -z "$$DEPLOYER" ] || [ "$$DEPLOYER" = "(unset)" ]; then
+          fail "cannot resolve the deployer identity from the build environment"
+        fi
+        if gcloud iam service-accounts add-iam-policy-binding "$$RUNTIME_SA" \
+             --member="serviceAccount:$$DEPLOYER" \
+             --role=roles/iam.serviceAccountUser \
+             --quiet >/dev/null 2>&1; then
+          echo "   actAs binding ensured for $$DEPLOYER"
+        else
+          # Adding the binding needs serviceAccountAdmin, which the deployer may not
+          # have. That is only a real blocker if it cannot already act as the runtime
+          # SA (roles/cloudbuild.builds.builder normally grants that project-wide).
+          echo "   could not add actAs binding; checking whether it is already held"
+          gcloud iam service-accounts test-iam-permissions "$$RUNTIME_SA" \
+            --permissions=iam.serviceAccounts.actAs --format='value(permissions)' 2>/dev/null \
+            | grep -q "iam.serviceAccounts.actAs" \
+            || fail "deployer '$$DEPLOYER' cannot actAs the runtime SA and cannot grant itself the binding (needs roles/iam.serviceAccountUser on $$RUNTIME_SA, or roles/iam.serviceAccountAdmin)"
+          echo "   deployer already holds iam.serviceAccounts.actAs"
+        fi
+
+        echo "== ensure-infra OK"
 
   - id: build
     name: gcr.io/cloud-builders/docker
@@ -52,32 +144,33 @@ steps:
     args:
       - -ceu
       - |
-        if gcloud secrets describe repo-closer-github-token >/dev/null 2>&1; then
-          gcloud secrets add-iam-policy-binding repo-closer-github-token \
-            --member="serviceAccount:${_SA}@$PROJECT_ID.iam.gserviceaccount.com" \
-            --role=roles/secretmanager.secretAccessor \
-            --quiet >/dev/null
+        RUNTIME_SA="${_SA}@$PROJECT_ID.iam.gserviceaccount.com"
+        IMAGE="${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE}:$BUILD_ID"
+        SECRETS="MAINTENANCE_API_TOKEN=repo-closer-api-token:latest,MAINTENANCE_APPROVAL_SECRET=repo-closer-approval-secret:latest"
 
-          gcloud run deploy "${_SERVICE}" \
-            --image="${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE}:$BUILD_ID" \
-            --region="${_REGION}" \
-            --service-account="${_SA}@$PROJECT_ID.iam.gserviceaccount.com" \
-            --port=8080 --cpu=1 --memory=1Gi \
-            --min-instances=0 --max-instances=2 --concurrency=1 --timeout=3600 \
-            --set-env-vars="^@^GOOGLE_CLOUD_PROJECT=$PROJECT_ID@GOOGLE_CLOUD_LOCATION=global@MAINTENANCE_MODEL=${_MODEL}@MAINTENANCE_STORE=firestore" \
-            --set-secrets="MAINTENANCE_API_TOKEN=repo-closer-api-token:latest,MAINTENANCE_APPROVAL_SECRET=repo-closer-approval-secret:latest,GITHUB_TOKEN=repo-closer-github-token:latest" \
-            --allow-unauthenticated --quiet
+        # The GitHub token is optional: without it the service still boots and
+        # serves /health, it just cannot reach private repositories.
+        if gcloud secrets describe repo-closer-github-token >/dev/null 2>&1; then
+          echo "-- github token secret found, wiring it into the revision"
+          gcloud secrets add-iam-policy-binding repo-closer-github-token \
+            --member="serviceAccount:$$RUNTIME_SA" \
+            --role=roles/secretmanager.secretAccessor \
+            --condition=None \
+            --quiet >/dev/null
+          SECRETS="$$SECRETS,GITHUB_TOKEN=repo-closer-github-token:latest"
         else
-          gcloud run deploy "${_SERVICE}" \
-            --image="${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE}:$BUILD_ID" \
-            --region="${_REGION}" \
-            --service-account="${_SA}@$PROJECT_ID.iam.gserviceaccount.com" \
-            --port=8080 --cpu=1 --memory=1Gi \
-            --min-instances=0 --max-instances=2 --concurrency=1 --timeout=3600 \
-            --set-env-vars="^@^GOOGLE_CLOUD_PROJECT=$PROJECT_ID@GOOGLE_CLOUD_LOCATION=global@MAINTENANCE_MODEL=${_MODEL}@MAINTENANCE_STORE=firestore" \
-            --set-secrets="MAINTENANCE_API_TOKEN=repo-closer-api-token:latest,MAINTENANCE_APPROVAL_SECRET=repo-closer-approval-secret:latest" \
-            --allow-unauthenticated --quiet
+          echo "-- no github token secret; deploying without GITHUB_TOKEN"
         fi
+
+        gcloud run deploy "${_SERVICE}" \
+          --image="$$IMAGE" \
+          --region="${_REGION}" \
+          --service-account="$$RUNTIME_SA" \
+          --port=8080 --cpu=1 --memory=1Gi \
+          --min-instances=0 --max-instances=2 --concurrency=1 --timeout=3600 \
+          --set-env-vars="^@^GOOGLE_CLOUD_PROJECT=$PROJECT_ID@GOOGLE_CLOUD_LOCATION=global@MAINTENANCE_MODEL=${_MODEL}@MAINTENANCE_STORE=firestore" \
+          --set-secrets="$$SECRETS" \
+          --allow-unauthenticated --quiet
 
   - id: smoke
     name: gcr.io/google.com/cloudsdktool/cloud-sdk
@@ -87,8 +180,12 @@ steps:
       - |
         URL="$$(gcloud run services describe "${_SERVICE}" --region="${_REGION}" --format='value(status.url)')"
         test -n "$$URL"
-        curl -fsS "$$URL/health" | grep -q '"ok":true'
+        REVISION="$$(gcloud run services describe "${_SERVICE}" --region="${_REGION}" --format='value(status.latestReadyRevisionName)')"
         echo "REPO_CLOSER_URL=$$URL"
+        echo "REPO_CLOSER_REVISION=$$REVISION"
+        curl -fsS --retry 5 --retry-connrefused --retry-delay 5 --max-time 60 "$$URL/health" | tee /workspace/health.json
+        grep -q '"ok":true' /workspace/health.json
+        grep -q '"service":"osa-repo-closer"' /workspace/health.json
 
 images:
   - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE}:$BUILD_ID
