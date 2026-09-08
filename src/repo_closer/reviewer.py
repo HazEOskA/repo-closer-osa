@@ -24,6 +24,8 @@ class Reviewer:
 
     def review(self, run: Run, workspace: Path, patch: str) -> ReviewResult:
         paths, _ = validate_patch(run, patch, self.policy)
+        if not run.allowed_commands:
+            return ReviewResult(False, f"Review FAIL: brak zatwierdzonych komend weryfikacyjnych; paths={paths}", ())
         results = []
         for argv in run.allowed_commands:
             self.policy.validate_command(run, argv)
