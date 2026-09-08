@@ -14,6 +14,8 @@ from repo_closer.persistence import MemoryRunRepository
 from repo_closer.planner import Planner
 from repo_closer.policy import PolicyEngine, PolicyViolation
 from repo_closer.gcp import BuildResult, DeployResult
+from repo_closer.runner import ClosureRunner
+from repo_closer.ui import DASHBOARD_HTML
 
 SHA = "1" * 40
 TREE = "2" * 40
@@ -198,3 +200,48 @@ def test_fix_approval_rejects_missing_verification_commands():
     with pytest.raises(ValueError, match="komendy weryfikacyjnej"):
         ctl.approve_fix(run.run_id, "osa", ["app.py"], [])
     assert ctl.get(run.run_id).state == RunState.AWAITING_FIX_APPROVAL
+
+
+
+def test_closure_runner_drives_one_approval_to_completed_without_deploy():
+    ctl, _ = make_controller()
+    run = ctl.start(Run.create("https://github.com/acme/demo", "main", "Napraw app.py"))
+    run = ClosureRunner(ctl, sleep=lambda _: None).close(
+        run.run_id,
+        "osa",
+        ["app.py"],
+        [VERIFY_COMMAND],
+        ci_wait_seconds=0,
+        close_without_deploy=True,
+    )
+    assert run.state == RunState.COMPLETED
+    assert run.pr_url.endswith("/pull/1")
+    assert run.merge_sha == "4" * 40
+    assert run.verification_summary.startswith("Review PASS")
+
+
+def test_closure_runner_blocks_instead_of_claiming_done_on_red_ci():
+    ctl, _ = make_controller()
+
+    class RedWriter(FakeWriter):
+        def require_successful_checks(self, repository, head_sha):
+            raise RuntimeError("CI nie jest green")
+
+    ctl.github_write = RedWriter()
+    run = ctl.start(Run.create("https://github.com/acme/demo", "main", "Napraw app.py"))
+    run = ClosureRunner(ctl, sleep=lambda _: None).close(
+        run.run_id,
+        "osa",
+        ["app.py"],
+        [VERIFY_COMMAND],
+        ci_wait_seconds=0,
+        close_without_deploy=True,
+    )
+    assert run.state == RunState.BLOCKED
+    assert "CI gate odrzucił closure" in run.failure_reason
+
+
+def test_dashboard_exposes_actual_agent_closure_action():
+    assert "OSA REPO CLOSER" in DASHBOARD_HTML
+    assert "ACTUAL AGENT" in DASHBOARD_HTML
+    assert 'fetch("/closures"' in DASHBOARD_HTML
