@@ -219,6 +219,7 @@ class Run:
     image_digest: str | None = None
     built_image: str | None = None
     deployment_target: str | None = None
+    deployment_url: str | None = None
     revision: str | None = None
     verification_summary: str | None = None
     iteration: int = 0
