@@ -68,12 +68,15 @@ class FakeModel:
 
 class FakeWriter:
     def publish_branch(self, repository, workspace, branch, message): return "3" * 40
-    def create_pr(self, repository, branch, title, body): return "https://github.com/acme/demo/pull/1"
+    def create_pr(self, repository, branch, title, body): return "https://github.com/acme/demo/pull/1", 1
+    def require_successful_checks(self, repository, head_sha): return (("CI", "success"),)
+    def merge_pr(self, repository, pr_number, head_sha): return "4" * 40
 
 
 class FakeGCP:
-    def build(self, workspace, project, region, artifact_repo, image_name):
-        return BuildResult("build-1", f"{region}-docker.pkg.dev/{project}/{artifact_repo}/{image_name}:x", "sha256:abc")
+    def build(self, workspace, project, region, artifact_repo, image_name, source_sha):
+        base = f"{region}-docker.pkg.dev/{project}/{artifact_repo}/{image_name}"
+        return BuildResult("build-1", f"{base}:{source_sha[:12]}", "sha256:abc", f"{base}@sha256:abc")
     def deploy(self, build, project, region, service, service_account=None):
         return DeployResult(service, region, "rev-1", "https://demo.example")
     def verify(self, url, path="/health"):
@@ -106,12 +109,20 @@ def test_full_happy_path_all_gates():
     assert run.state == RunState.PR_OPEN
     assert run.head_sha == "3" * 40
     assert run.pr_url.endswith("/pull/1")
+    assert run.pr_number == 1
+
+    run = ctl.approve_merge(run.run_id, "osa")
+    assert run.state == RunState.MERGED
+    assert run.merge_sha == "4" * 40
 
     run = ctl.build(run.run_id, "p", "europe-west1", "repo", "img", "svc")
     assert run.state == RunState.AWAITING_DEPLOY_APPROVAL
     assert run.image_digest == "sha256:abc"
+    assert run.built_image == "europe-west1-docker.pkg.dev/p/repo/img@sha256:abc"
+    assert run.build_project == "p"
+    assert run.build_region == "europe-west1"
 
-    run = ctl.approve_deploy(run.run_id, "osa", "p", "europe-west1", "svc", "image@sha256:abc")
+    run = ctl.approve_deploy(run.run_id, "osa")
     assert run.state == RunState.COMPLETED
     assert run.revision == "rev-1"
     assert run.verification_summary == '{"ok":true}'
@@ -145,3 +156,34 @@ def test_approval_is_bound_to_target():
     record = authority.issue(run, "fix", "osa", {"allowed_files": ["app.py"]})
     assert authority.verify(run, record, "fix", {"allowed_files": ["app.py"]})
     assert not authority.verify(run, record, "fix", {"allowed_files": ["other.py"]})
+
+
+def test_merge_requires_green_ci():
+    ctl, _ = make_controller()
+    run = ctl.start(Run.create("https://github.com/acme/demo", "main", "Napraw app.py"))
+    run = ctl.approve_fix(run.run_id, "osa", ["app.py"], [])
+    run = ctl.approve_pr(run.run_id, "osa")
+
+    class RedWriter(FakeWriter):
+        def require_successful_checks(self, repository, head_sha):
+            raise RuntimeError("CI nie jest green")
+
+    ctl.github_write = RedWriter()
+    with pytest.raises(RuntimeError, match="CI nie jest green"):
+        ctl.approve_merge(run.run_id, "osa")
+    assert ctl.get(run.run_id).state == RunState.PR_OPEN
+
+
+def test_deploy_uses_only_built_immutable_image():
+    ctl, _ = make_controller()
+    run = ctl.start(Run.create("https://github.com/acme/demo", "main", "Napraw app.py"))
+    run = ctl.approve_fix(run.run_id, "osa", ["app.py"], [])
+    run = ctl.approve_pr(run.run_id, "osa")
+    run = ctl.approve_merge(run.run_id, "osa")
+    run = ctl.build(run.run_id, "p", "europe-west1", "repo", "img", "svc")
+    assert "@sha256:" in run.built_image
+
+    run = ctl.approve_deploy(run.run_id, "osa")
+    assert run.state == RunState.COMPLETED
+    assert run.deployment_target == "svc"
+    assert run.deployment_url == "https://demo.example"
