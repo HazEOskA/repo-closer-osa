@@ -16,7 +16,7 @@ from .mapper import Mapper
 from .persistence import default_repository
 from .planner import Planner
 
-app = FastAPI(title="OSA Repo Closer", version="0.2.0")
+app = FastAPI(title="OSA Repo Closer", version="0.3.0")
 
 
 def _token_guard(authorization: str | None = Header(default=None)) -> None:
@@ -70,17 +70,13 @@ class BuildRequest(BaseModel):
 
 class DeployApproval(BaseModel):
     actor: str = "operator"
-    project: str
-    region: str
-    service: str
-    image: str
     service_account: str | None = None
     health_path: str = "/health"
 
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "osa-repo-closer", "version": "0.2.0"}
+    return {"ok": True, "service": "osa-repo-closer", "version": "0.3.0"}
 
 
 @app.post("/runs", dependencies=[Depends(_token_guard)])
@@ -110,6 +106,12 @@ def approve_pr(run_id: str, req: ActorRequest):
     except Exception as exc: raise HTTPException(400, str(exc)) from exc
 
 
+@app.post("/runs/{run_id}/approve-merge", dependencies=[Depends(_token_guard)])
+def approve_merge(run_id: str, req: ActorRequest):
+    try: return make_controller().approve_merge(run_id, req.actor).to_dict()
+    except Exception as exc: raise HTTPException(400, str(exc)) from exc
+
+
 @app.post("/runs/{run_id}/build", dependencies=[Depends(_token_guard)])
 def build(run_id: str, req: BuildRequest):
     try: return make_controller().build(run_id, req.project, req.region, req.artifact_repo, req.image_name, req.deployment_target).to_dict()
@@ -118,7 +120,7 @@ def build(run_id: str, req: BuildRequest):
 
 @app.post("/runs/{run_id}/approve-deploy", dependencies=[Depends(_token_guard)])
 def approve_deploy(run_id: str, req: DeployApproval):
-    try: return make_controller().approve_deploy(run_id, req.actor, req.project, req.region, req.service, req.image, req.service_account, req.health_path).to_dict()
+    try: return make_controller().approve_deploy(run_id, req.actor, req.service_account, req.health_path).to_dict()
     except Exception as exc: raise HTTPException(400, str(exc)) from exc
 
 
