@@ -182,7 +182,7 @@ class Controller:
             )
             run.head_sha = head_sha
             if not run.pr_url:
-                run.pr_url = self.github_write.create_pr(
+                run.pr_url, run.pr_number = self.github_write.create_pr(
                     run.repository, work_branch,
                     f"Repo Closer: {run.goal[:72]}",
                     f"Automatyczny maintenance run `{run.run_id}`.\n\nPlan: `{run.repair_plan.plan_hash if run.repair_plan else 'n/a'}`\nDiff: `{run.diff_hash}`\nReview: {run.verification_summary}"
@@ -194,20 +194,66 @@ class Controller:
         finally:
             if workspace: self.workspaces.cleanup(workspace)
 
+    def approve_merge(self, run_id: str, actor: str, ttl_minutes: int = 30) -> Run:
+        run = self.get(run_id)
+        if (
+            run.state != RunState.PR_OPEN
+            or not run.repository
+            or not run.pr_url
+            or not run.pr_number
+            or not run.head_sha
+        ):
+            raise ValueError("Merge wymaga PR_OPEN, pr_number i przypiętego head_sha.")
+        if not self.github_write:
+            return self._block(run, "Brak GITHUB_TOKEN / GitHub write adapter.")
+
+        # Check CI before issuing a mutation approval. merge_pr repeats the check
+        # immediately before the write to protect against race/drift.
+        self.github_write.require_successful_checks(run.repository, run.head_sha)
+        target = {
+            "pr_number": run.pr_number,
+            "pr_url": run.pr_url,
+            "head_sha": run.head_sha,
+            "base_sha": run.base_sha,
+            "base_branch": run.repository.branch,
+        }
+        record = self._authority().issue(run, "merge", actor, target, ttl_minutes)
+        if not self._authority().verify(run, record, "merge", target):
+            raise RuntimeError("Merge approval binding verification failed.")
+        run.approvals.append(record)
+        run.capabilities = sorted(set(run.capabilities) | {"repo.merge"})
+        run.transition(RunState.MERGING); self._save(run)
+        try:
+            run.merge_sha = self.github_write.merge_pr(run.repository, run.pr_number, run.head_sha)
+            run.transition(RunState.MERGED)
+            return self._save(run)
+        except Exception as exc:
+            return self._fail(run, exc)
+
     def build(self, run_id: str, project: str, region: str, artifact_repo: str, image_name: str, deployment_target: str) -> Run:
         run = self.get(run_id)
-        if run.state != RunState.PR_OPEN or not run.repository or not run.head_sha:
-            raise ValueError("Build wymaga PR_OPEN i head_sha.")
+        if run.state != RunState.MERGED or not run.repository or not run.merge_sha:
+            raise ValueError("Build wymaga MERGED i canonical merge_sha.")
         run.capabilities = sorted(set(run.capabilities) | {"gcp.build"})
         run.transition(RunState.BUILDING); self._save(run)
         workspace = None
         try:
-            build_repo = RepositoryRef(run.repository.url, run.repository.owner, run.repository.repo, run.work_branch or run.repository.branch, run.head_sha)
+            build_repo = RepositoryRef(
+                run.repository.url,
+                run.repository.owner,
+                run.repository.repo,
+                run.repository.branch,
+                run.merge_sha,
+            )
             workspace = self.workspaces.create(build_repo, run.run_id, os.getenv("GITHUB_TOKEN"))
-            result = self.gcp.build(workspace, project, region, artifact_repo, image_name)
+            result = self.gcp.build(workspace, project, region, artifact_repo, image_name, run.merge_sha)
             run.build_id = result.build_id
-            run.image_digest = result.digest or result.image
+            run.build_project = project
+            run.build_region = region
+            run.image_digest = result.digest
+            run.built_image = result.immutable_image
             run.deployment_target = deployment_target
+            run.deployment_url = None
             run.transition(RunState.AWAITING_DEPLOY_APPROVAL)
             return self._save(run)
         except Exception as exc:
@@ -216,13 +262,38 @@ class Controller:
             if workspace: self.workspaces.cleanup(workspace)
 
     def approve_deploy(
-        self, run_id: str, actor: str, project: str, region: str, service: str,
-        image: str, service_account: str | None = None, health_path: str = "/health", ttl_minutes: int = 30,
+        self,
+        run_id: str,
+        actor: str,
+        service_account: str | None = None,
+        health_path: str = "/health",
+        ttl_minutes: int = 30,
     ) -> Run:
         run = self.get(run_id)
         if run.state != RunState.AWAITING_DEPLOY_APPROVAL:
             raise ValueError("Run nie czeka na deploy approval.")
-        target = {"project": project, "region": region, "service": service, "image": image, "image_digest": run.image_digest}
+        if not all((
+            run.build_id,
+            run.build_project,
+            run.build_region,
+            run.image_digest,
+            run.built_image,
+            run.deployment_target,
+            run.merge_sha,
+        )):
+            raise ValueError("Brak kompletnego immutable build evidence do deployu.")
+        if "@sha256:" not in run.built_image:
+            raise ValueError("built_image nie jest immutable image@sha256:digest.")
+
+        target = {
+            "project": run.build_project,
+            "region": run.build_region,
+            "service": run.deployment_target,
+            "image": run.built_image,
+            "image_digest": run.image_digest,
+            "merge_sha": run.merge_sha,
+            "build_id": run.build_id,
+        }
         record = self._authority().issue(run, "deploy", actor, target, ttl_minutes)
         if not self._authority().verify(run, record, "deploy", target):
             raise RuntimeError("Deploy approval binding verification failed.")
@@ -231,23 +302,55 @@ class Controller:
         run.transition(RunState.DEPLOYING); self._save(run)
         try:
             from .gcp import BuildResult
-            build = BuildResult(run.build_id or "", image, run.image_digest or "")
-            deployed = self.gcp.deploy(build, project, region, service, service_account)
+            build = BuildResult(
+                run.build_id,
+                run.built_image,
+                run.image_digest,
+                run.built_image,
+            )
+            deployed = self.gcp.deploy(
+                build,
+                run.build_project,
+                run.build_region,
+                run.deployment_target,
+                service_account,
+            )
             run.revision = deployed.revision
-            run.deployment_target = deployed.url or service
+            run.deployment_url = deployed.url
             run.transition(RunState.VERIFYING); self._save(run)
             ok, detail = self.gcp.verify(deployed.url, health_path)
             run.verification_summary = detail
             if ok:
                 run.transition(RunState.COMPLETED)
                 return self._save(run)
-            if run.iteration < run.max_iterations and run.head_sha:
-                run.repository = RepositoryRef(run.repository.url, run.repository.owner, run.repository.repo, run.work_branch or run.repository.branch, run.head_sha)
-                run.base_sha = run.head_sha
-                run.diff_text = None; run.diff_hash = None
+
+            if run.iteration < run.max_iterations and run.merge_sha and run.repository:
+                run.repository = RepositoryRef(
+                    run.repository.url,
+                    run.repository.owner,
+                    run.repository.repo,
+                    run.repository.branch,
+                    run.merge_sha,
+                )
+                run.base_sha = run.merge_sha
+                run.diff_text = None
+                run.diff_hash = None
+                run.work_branch = None
+                run.head_sha = None
+                run.pr_url = None
+                run.pr_number = None
+                run.merge_sha = None
+                run.build_id = None
+                run.build_project = None
+                run.build_region = None
+                run.image_digest = None
+                run.built_image = None
+                run.revision = None
+                run.deployment_url = None
                 run.goal = run.goal + f"\nBłąd po deploy: {detail[-2000:]}"
                 run.transition(RunState.FIXING); self._save(run)
                 return self._fix_review_loop(run, feedback=detail)
+
             run.failure_reason = f"Verify FAIL: {detail[-3000:]}"
             run.transition(RunState.FAILED)
             return self._save(run)
@@ -256,8 +359,8 @@ class Controller:
 
     def complete_without_deploy(self, run_id: str) -> Run:
         run = self.get(run_id)
-        if run.state != RunState.PR_OPEN:
-            raise ValueError("Tylko PR_OPEN może zakończyć się bez deployu.")
+        if run.state != RunState.MERGED:
+            raise ValueError("Tylko MERGED może zakończyć się bez deployu.")
         run.transition(RunState.COMPLETED)
         return self._save(run)
 

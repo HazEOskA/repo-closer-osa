@@ -23,6 +23,8 @@ class RunState(StrEnum):
     AWAITING_PR_APPROVAL = "AWAITING_PR_APPROVAL"
     PUBLISHING_PR = "PUBLISHING_PR"
     PR_OPEN = "PR_OPEN"
+    MERGING = "MERGING"
+    MERGED = "MERGED"
     BUILDING = "BUILDING"
     AWAITING_DEPLOY_APPROVAL = "AWAITING_DEPLOY_APPROVAL"
     DEPLOYING = "DEPLOYING"
@@ -52,7 +54,9 @@ _ALLOWED_TRANSITIONS: dict[RunState, set[RunState]] = {
     RunState.REVIEWING: {RunState.FIXING, RunState.AWAITING_PR_APPROVAL},
     RunState.AWAITING_PR_APPROVAL: {RunState.PUBLISHING_PR},
     RunState.PUBLISHING_PR: {RunState.PR_OPEN},
-    RunState.PR_OPEN: {RunState.BUILDING, RunState.COMPLETED},
+    RunState.PR_OPEN: {RunState.MERGING, RunState.COMPLETED},
+    RunState.MERGING: {RunState.MERGED},
+    RunState.MERGED: {RunState.BUILDING, RunState.COMPLETED},
     RunState.BUILDING: {RunState.AWAITING_DEPLOY_APPROVAL},
     RunState.AWAITING_DEPLOY_APPROVAL: {RunState.DEPLOYING},
     RunState.DEPLOYING: {RunState.VERIFYING},
@@ -207,9 +211,15 @@ class Run:
     diff_hash: str | None = None
     head_sha: str | None = None
     pr_url: str | None = None
+    pr_number: int | None = None
+    merge_sha: str | None = None
     build_id: str | None = None
+    build_project: str | None = None
+    build_region: str | None = None
     image_digest: str | None = None
+    built_image: str | None = None
     deployment_target: str | None = None
+    deployment_url: str | None = None
     revision: str | None = None
     verification_summary: str | None = None
     iteration: int = 0
