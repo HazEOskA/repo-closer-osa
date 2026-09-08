@@ -103,6 +103,8 @@ class Controller:
         run = self.get(run_id)
         if run.state != RunState.AWAITING_FIX_APPROVAL:
             raise ValueError("Run nie czeka na zgodę naprawczą.")
+        if not allowed_commands:
+            raise ValueError("Closure wymaga co najmniej jednej jawnie zatwierdzonej komendy weryfikacyjnej.")
         target = {
             "allowed_files": allowed_files or ["*"],
             "allowed_commands": allowed_commands or [],

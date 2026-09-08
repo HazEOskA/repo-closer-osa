@@ -52,6 +52,9 @@ class FakeWorkspace:
         pass
 
 
+VERIFY_COMMAND = ["python", "-c", "print(\"ok\")"]
+
+
 PATCH = """diff --git a/app.py b/app.py
 index 1234567..7654321 100644
 --- a/app.py
@@ -101,7 +104,7 @@ def test_full_happy_path_all_gates():
     run = ctl.start(Run.create("https://github.com/acme/demo", "main", "Napraw app.py"))
     assert run.state == RunState.AWAITING_FIX_APPROVAL
 
-    run = ctl.approve_fix(run.run_id, "osa", ["app.py"], [])
+    run = ctl.approve_fix(run.run_id, "osa", ["app.py"], [VERIFY_COMMAND])
     assert run.state == RunState.AWAITING_PR_APPROVAL
     assert run.diff_hash
 
@@ -161,7 +164,7 @@ def test_approval_is_bound_to_target():
 def test_merge_requires_green_ci():
     ctl, _ = make_controller()
     run = ctl.start(Run.create("https://github.com/acme/demo", "main", "Napraw app.py"))
-    run = ctl.approve_fix(run.run_id, "osa", ["app.py"], [])
+    run = ctl.approve_fix(run.run_id, "osa", ["app.py"], [VERIFY_COMMAND])
     run = ctl.approve_pr(run.run_id, "osa")
 
     class RedWriter(FakeWriter):
@@ -177,7 +180,7 @@ def test_merge_requires_green_ci():
 def test_deploy_uses_only_built_immutable_image():
     ctl, _ = make_controller()
     run = ctl.start(Run.create("https://github.com/acme/demo", "main", "Napraw app.py"))
-    run = ctl.approve_fix(run.run_id, "osa", ["app.py"], [])
+    run = ctl.approve_fix(run.run_id, "osa", ["app.py"], [VERIFY_COMMAND])
     run = ctl.approve_pr(run.run_id, "osa")
     run = ctl.approve_merge(run.run_id, "osa")
     run = ctl.build(run.run_id, "p", "europe-west1", "repo", "img", "svc")
@@ -187,3 +190,11 @@ def test_deploy_uses_only_built_immutable_image():
     assert run.state == RunState.COMPLETED
     assert run.deployment_target == "svc"
     assert run.deployment_url == "https://demo.example"
+
+
+def test_fix_approval_rejects_missing_verification_commands():
+    ctl, _ = make_controller()
+    run = ctl.start(Run.create("https://github.com/acme/demo", "main", "Napraw app.py"))
+    with pytest.raises(ValueError, match="komendy weryfikacyjnej"):
+        ctl.approve_fix(run.run_id, "osa", ["app.py"], [])
+    assert ctl.get(run.run_id).state == RunState.AWAITING_FIX_APPROVAL
