@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import secrets
 from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from .approval import ApprovalAuthority
@@ -15,6 +16,8 @@ from .llm import VertexFixerModel
 from .mapper import Mapper
 from .persistence import default_repository
 from .planner import Planner
+from .runner import ClosureRunner
+from .ui import DASHBOARD_HTML
 
 app = FastAPI(title="OSA Repo Closer", version="0.3.0")
 
@@ -50,6 +53,14 @@ class StartRequest(BaseModel):
     budget_limit: float = Field(default=5.0, ge=0.1, le=100.0)
 
 
+class ClosureRequest(StartRequest):
+    actor: str = "operator"
+    allowed_files: list[str] = Field(default_factory=lambda: ["*"])
+    allowed_commands: list[list[str]]
+    ci_wait_seconds: int = Field(default=180, ge=0, le=900)
+    close_without_deploy: bool = True
+
+
 class FixApproval(BaseModel):
     actor: str = "operator"
     allowed_files: list[str] = Field(default_factory=lambda: ["*"])
@@ -74,9 +85,40 @@ class DeployApproval(BaseModel):
     health_path: str = "/health"
 
 
+@app.get("/", response_class=HTMLResponse)
+def dashboard():
+    return HTMLResponse(DASHBOARD_HTML)
+
+
 @app.get("/health")
 def health():
     return {"ok": True, "service": "osa-repo-closer", "version": "0.3.0"}
+
+
+@app.post("/closures", dependencies=[Depends(_token_guard)])
+def close_repo(req: ClosureRequest):
+    try:
+        controller = make_controller()
+        run = Run.create(
+            req.repo_url,
+            req.branch,
+            req.goal,
+            max_iterations=req.max_iterations,
+            budget_limit=req.budget_limit,
+        )
+        run = controller.start(run, req.sha)
+        if run.state.value != "AWAITING_FIX_APPROVAL":
+            return run.to_dict()
+        return ClosureRunner(controller).close(
+            run.run_id,
+            req.actor,
+            req.allowed_files,
+            req.allowed_commands,
+            ci_wait_seconds=req.ci_wait_seconds,
+            close_without_deploy=req.close_without_deploy,
+        ).to_dict()
+    except Exception as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 @app.post("/runs", dependencies=[Depends(_token_guard)])
