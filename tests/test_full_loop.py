@@ -52,7 +52,10 @@ class FakeWorkspace:
         pass
 
 
-VERIFY_COMMAND = ["python", "-c", "print(\"ok\")"]\n\n\nPATCH = """diff --git a/app.py b/app.py
+VERIFY_COMMAND = ["python", "-c", "print(\"ok\")"]
+
+
+PATCH = """diff --git a/app.py b/app.py
 index 1234567..7654321 100644
 --- a/app.py
 +++ b/app.py
