@@ -1,0 +1,11 @@
+{
+  "brand_character": "OSA",
+  "identity_lock": "muscular anthropomorphic wasp",
+  "logo_path": "docs/assets/osa-mascot-logo.png",
+  "banner_path": "docs/assets/osa-mascot-banner.png",
+  "primary_format": "png",
+  "policy": "reuse existing canonical OSA assets; generate only if missing or explicitly approved",
+  "banner_rule": "repo-specific narrative, same canonical OSA character",
+  "svg_primary_allowed": false,
+  "reference_rule": "use osa-mascot-logo.png as the local visual source of truth for future banner generation"
+}
